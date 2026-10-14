@@ -4,6 +4,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from pydantic import AnyUrl
 
+from aggregator.tracing import traced_call
 from aggregator.upstream import UpstreamManager
 
 
@@ -20,7 +21,7 @@ async def main():
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict):
-        result = await manager.call(name, arguments or {})
+        result = await traced_call(manager, name, arguments or {}, source="mcp-client")
         if result.isError:
             raise RuntimeError(result.content[0].text if result.content else "tool error")
         return result.content

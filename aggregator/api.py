@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from aggregator.tracing import traced_call
 from aggregator.upstream import UpstreamManager
 
 manager = UpstreamManager("servers.json")
@@ -46,7 +47,7 @@ def list_tools():
 @app.post("/call")
 async def call_tool(body: CallIn):
     try:
-        result = await manager.call(body.tool, body.arguments)
+        result = await traced_call(manager, body.tool, body.arguments, source="dashboard")
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {
