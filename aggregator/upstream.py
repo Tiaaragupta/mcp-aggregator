@@ -11,6 +11,7 @@ from mcp.client.stdio import stdio_client
 SEP = "__"                # separates server name from tool/prompt name
 RES_PREFIX = "agg://"     # resource URIs become agg://<server>/<original uri>
 CONNECT_TIMEOUT = 15
+HEALTH_TIMEOUT = 5
 
 
 def log(msg):
@@ -23,6 +24,7 @@ class Upstream:
     name: str
     config: dict
     status: str = "starting"
+    health: str = "unknown"
     error: str | None = None
     session: ClientSession | None = None
     tools: list = field(default_factory=list)
@@ -47,6 +49,7 @@ class UpstreamManager:
         self.prompt_defs = {}    # gateway prompt name -> types.Prompt
         self.prompt_map = {}     # gateway prompt name -> (server, original name)
         self.block: list[str] = []
+        self._health_task: asyncio.Task | None = None
 
     async def start(self):
         config = json.loads(self.config_path.read_text())
@@ -76,6 +79,7 @@ class UpstreamManager:
         if up.status != "connected":
             self.upstreams.pop(name, None)
             raise ValueError(up.error or "failed to connect")
+        up.health = "healthy"
         log(f"connected to '{name}': {len(up.tools)} tools, "
             f"{len(up.resources)} resources, {len(up.prompts)} prompts")
         return up
@@ -100,12 +104,8 @@ class UpstreamManager:
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
-                    up.tools = (await session.list_tools()).tools
-                    # Resources and prompts are optional in MCP, so a server may not have them
-                    up.resources = await self._optional(session.list_resources, "resources")
-                    up.prompts = await self._optional(session.list_prompts, "prompts")
                     up.session = session
-                    self._index(up)
+                    await self._refresh(up)
                     up.status = "connected"
                     ready.set()
                     await up.stop.wait()  # stay connected until remove_server sets stop
@@ -121,10 +121,44 @@ class UpstreamManager:
 
     @staticmethod
     async def _optional(fn, attr: str):
+        # Resources and prompts are optional in MCP, so a server may not have them
         try:
             return getattr(await fn(), attr)
         except Exception:
             return []
+
+    async def _refresh(self, up: Upstream):
+        """Re-discover tools, resources and prompts from one server and rebuild its entries."""
+        up.tools = (await up.session.list_tools()).tools
+        up.resources = await self._optional(up.session.list_resources, "resources")
+        up.prompts = await self._optional(up.session.list_prompts, "prompts")
+        self._unindex(up.name)
+        self._index(up)
+
+    async def health_check(self) -> dict:
+        """Ping every connected server. Re-discover on success, drop from the registry on failure."""
+        results = {}
+        for name, up in list(self.upstreams.items()):
+            if up.session is None:
+                results[name] = "not connected"
+                continue
+            try:
+                await asyncio.wait_for(self._refresh(up), HEALTH_TIMEOUT)
+                up.health = "healthy"
+            except Exception as e:
+                up.health = f"unhealthy: {type(e).__name__}"
+                self._unindex(name)
+                log(f"health check failed for '{name}': {up.health}")
+            results[name] = up.health
+        return results
+
+    def start_health_loop(self, interval: float = 30):
+        self._health_task = asyncio.create_task(self._health_loop(interval))
+
+    async def _health_loop(self, interval: float):
+        while True:
+            await asyncio.sleep(interval)
+            await self.health_check()
 
     def _blocked(self, key: str) -> bool:
         return any(fnmatch.fnmatch(key, p) for p in self.block)
@@ -208,6 +242,7 @@ class UpstreamManager:
             {
                 "name": u.name,
                 "status": u.status,
+                "health": u.health,
                 "error": u.error,
                 "tools": len(u.tools),
                 "resources": len(u.resources),
@@ -218,6 +253,8 @@ class UpstreamManager:
         ]
 
     async def close(self):
+        if self._health_task:
+            self._health_task.cancel()
         for name in list(self.upstreams):
             await self.remove_server(name)
 

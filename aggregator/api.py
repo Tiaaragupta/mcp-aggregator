@@ -13,6 +13,7 @@ manager = UpstreamManager("servers.json")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await manager.start()
+    manager.start_health_loop(interval=30)
     yield
     await manager.close()
 
@@ -75,3 +76,8 @@ async def remove_server(name: str):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"ok": True}
+
+
+@app.post("/health/check")
+async def run_health_check():
+    return {"results": await manager.health_check()}

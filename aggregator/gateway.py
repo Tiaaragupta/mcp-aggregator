@@ -10,6 +10,7 @@ from aggregator.upstream import UpstreamManager
 async def main():
     manager = UpstreamManager("servers.json")
     await manager.start()
+    manager.start_health_loop(interval=30)
 
     server = Server("mcp-aggregator")
 
