@@ -26,6 +26,12 @@ class CallIn(BaseModel):
     arguments: dict = {}
 
 
+class ServerIn(BaseModel):
+    name: str
+    command: str
+    args: list[str] = []
+
+
 @app.get("/")
 def dashboard():
     return FileResponse("frontend/index.html")
@@ -46,3 +52,26 @@ async def call_tool(body: CallIn):
         "ok": not result.isError,
         "content": [c.model_dump() for c in result.content],
     }
+
+
+@app.get("/servers")
+def list_servers():
+    return {"servers": manager.status()}
+
+
+@app.post("/servers")
+async def add_server(body: ServerIn):
+    try:
+        await manager.add_server(body.name, {"command": body.command, "args": body.args})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "tools": [t for t in manager.list_tools() if t.startswith(body.name + "__")]}
+
+
+@app.delete("/servers/{name}")
+async def remove_server(name: str):
+    try:
+        await manager.remove_server(name)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True}
