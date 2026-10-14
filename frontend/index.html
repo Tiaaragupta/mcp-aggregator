@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Aggregator</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0b1120; color: #e2e8f0; margin: 0; padding: 2rem; }
+  h1 { margin: 0 0 0.25rem; }
+  .sub { color: #94a3b8; margin-bottom: 2rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; max-width: 1100px; }
+  .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 1.25rem; }
+  h2 { font-size: 1rem; margin: 0 0 1rem; }
+  .tool { display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 0.75rem;
+          border: 1px solid #1e293b; border-radius: 8px; margin-bottom: 0.5rem; cursor: pointer; font-family: monospace; }
+  .tool:hover, .tool.active { border-color: #6366f1; background: #1e1b4b; }
+  .badge { font-size: 0.7rem; color: #a5b4fc; }
+  textarea { width: 100%; height: 110px; background: #020617; color: #e2e8f0; border: 1px solid #1e293b;
+             border-radius: 8px; padding: 0.6rem; font-family: monospace; box-sizing: border-box; }
+  button { margin-top: 0.75rem; background: #6366f1; color: white; border: 0; border-radius: 8px;
+           padding: 0.6rem 1.2rem; font-weight: 600; cursor: pointer; }
+  button:hover { background: #4f46e5; }
+  pre { background: #020617; border-radius: 8px; padding: 0.75rem; white-space: pre-wrap; min-height: 3rem; }
+  .ok { color: #34d399; } .err { color: #f87171; }
+  .log { font-family: monospace; font-size: 0.8rem; max-height: 300px; overflow-y: auto; }
+  .log div { padding: 0.25rem 0; border-bottom: 1px solid #1e293b; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>MCP Aggregator</h1>
+<div class="sub">One endpoint, many servers. Click a tool, edit its arguments, and run it.</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Namespaced tools</h2>
+    <div id="tools"></div>
+  </div>
+
+  <div class="card">
+    <h2>Playground</h2>
+    <div id="selected" class="badge">Select a tool on the left</div>
+    <textarea id="args">{}</textarea>
+    <button id="run">Run tool</button>
+    <pre id="out"></pre>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Call log</h2>
+    <div id="log" class="log"></div>
+  </div>
+</div>
+
+<script>
+let current = null;
+
+async function loadTools() {
+  const res = await fetch("/tools");
+  const data = await res.json();
+  const box = document.getElementById("tools");
+  box.innerHTML = "";
+  data.tools.forEach(name => {
+    const row = document.createElement("div");
+    row.className = "tool";
+    row.innerHTML = `<span>${name}</span><span class="badge">${name.split("__")[0]}</span>`;
+    row.onclick = () => selectTool(name, row);
+    box.appendChild(row);
+  });
+}
+
+function selectTool(name, row) {
+  current = name;
+  document.querySelectorAll(".tool").forEach(r => r.classList.remove("active"));
+  row.classList.add("active");
+  document.getElementById("selected").textContent = "Selected: " + name;
+  const templates = {
+    "demo__add": { a: 2, b: 3 },
+    "demo__echo": { text: "hello" },
+    "notes__save_note": { text: "buy milk" },
+  };
+  document.getElementById("args").value = JSON.stringify(templates[name] || {}, null, 2);
+}
+
+function addLog(text, ok) {
+  const div = document.createElement("div");
+  div.className = ok ? "ok" : "err";
+  div.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
+  document.getElementById("log").prepend(div);
+}
+
+document.getElementById("run").onclick = async () => {
+  if (!current) { alert("Select a tool first"); return; }
+  const out = document.getElementById("out");
+  let args;
+  try { args = JSON.parse(document.getElementById("args").value || "{}"); }
+  catch (e) { out.textContent = "Invalid JSON: " + e.message; return; }
+
+  out.textContent = "running...";
+  const res = await fetch("/call", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tool: current, arguments: args }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    out.textContent = "Error: " + data.detail;
+    out.className = "err";
+    addLog(`${current} -> ${data.detail}`, false);
+    return;
+  }
+  const text = data.content.map(c => c.text).join("\n");
+  out.textContent = text;
+  out.className = data.ok ? "ok" : "err";
+  addLog(`${current} -> ${text}`, data.ok);
+};
+
+loadTools();
+</script>
+</body>
+</html>

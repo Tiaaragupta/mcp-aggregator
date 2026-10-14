@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "demo": { "command": "python", "args": ["demo_server/echo_server.py"] },
+    "notes": { "command": "python", "args": ["notes_server.py"] }
+  },
+  "policy": {
+    "block": ["*delete*"]
+  }
+}
