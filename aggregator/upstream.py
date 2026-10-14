@@ -8,7 +8,8 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
-SEP = "__"  # separates server name from tool name, e.g. demo__add
+SEP = "__"                # separates server name from tool/prompt name
+RES_PREFIX = "agg://"     # resource URIs become agg://<server>/<original uri>
 CONNECT_TIMEOUT = 15
 
 
@@ -25,15 +26,26 @@ class Upstream:
     error: str | None = None
     session: ClientSession | None = None
     tools: list = field(default_factory=list)
+    resources: list = field(default_factory=list)
+    prompts: list = field(default_factory=list)
     runner: asyncio.Task | None = None
     stop: asyncio.Event | None = None
+
+
+def _drop(d: dict, prefix: str):
+    for key in [k for k in d if k.startswith(prefix)]:
+        del d[key]
 
 
 class UpstreamManager:
     def __init__(self, config_path: str):
         self.config_path = Path(config_path)
         self.upstreams: dict[str, Upstream] = {}
-        self.registry: dict[str, tuple[str, str, types.Tool]] = {}
+        self.registry = {}       # tool key -> (server, tool name, tool)
+        self.resource_defs = {}  # gateway uri -> types.Resource
+        self.resource_map = {}   # gateway uri -> (server, original uri)
+        self.prompt_defs = {}    # gateway prompt name -> types.Prompt
+        self.prompt_map = {}     # gateway prompt name -> (server, original name)
         self.block: list[str] = []
 
     async def start(self):
@@ -64,7 +76,8 @@ class UpstreamManager:
         if up.status != "connected":
             self.upstreams.pop(name, None)
             raise ValueError(up.error or "failed to connect")
-        log(f"connected to '{name}': {len(up.tools)} tools")
+        log(f"connected to '{name}': {len(up.tools)} tools, "
+            f"{len(up.resources)} resources, {len(up.prompts)} prompts")
         return up
 
     async def remove_server(self, name: str):
@@ -88,6 +101,9 @@ class UpstreamManager:
                 async with ClientSession(read, write) as session:
                     await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
                     up.tools = (await session.list_tools()).tools
+                    # Resources and prompts are optional in MCP, so a server may not have them
+                    up.resources = await self._optional(session.list_resources, "resources")
+                    up.prompts = await self._optional(session.list_prompts, "prompts")
                     up.session = session
                     self._index(up)
                     up.status = "connected"
@@ -103,26 +119,78 @@ class UpstreamManager:
                 up.status = "disconnected"
             self._unindex(up.name)
 
+    @staticmethod
+    async def _optional(fn, attr: str):
+        try:
+            return getattr(await fn(), attr)
+        except Exception:
+            return []
+
+    def _blocked(self, key: str) -> bool:
+        return any(fnmatch.fnmatch(key, p) for p in self.block)
+
     def _index(self, up: Upstream):
         for tool in up.tools:
             key = f"{up.name}{SEP}{tool.name}"
-            if any(fnmatch.fnmatch(key, p) for p in self.block):
-                continue  # blocked by policy, so it never enters the registry
-            self.registry[key] = (up.name, tool.name, tool)
+            if not self._blocked(key):
+                self.registry[key] = (up.name, tool.name, tool)
+
+        for r in up.resources:
+            key = f"{RES_PREFIX}{up.name}/{r.uri}"
+            if not self._blocked(key):
+                self.resource_defs[key] = types.Resource(
+                    uri=key, name=r.name, description=r.description, mimeType=r.mimeType
+                )
+                self.resource_map[key] = (up.name, str(r.uri))
+
+        for p in up.prompts:
+            key = f"{up.name}{SEP}{p.name}"
+            if not self._blocked(key):
+                self.prompt_defs[key] = types.Prompt(
+                    name=key, description=p.description, arguments=p.arguments
+                )
+                self.prompt_map[key] = (up.name, p.name)
 
     def _unindex(self, name: str):
-        for key in [k for k in self.registry if k.startswith(name + SEP)]:
-            del self.registry[key]
+        _drop(self.registry, name + SEP)
+        _drop(self.prompt_defs, name + SEP)
+        _drop(self.prompt_map, name + SEP)
+        _drop(self.resource_defs, f"{RES_PREFIX}{name}/")
+        _drop(self.resource_map, f"{RES_PREFIX}{name}/")
+
+    def _session_for(self, server: str) -> ClientSession:
+        up = self.upstreams.get(server)
+        if up is None or up.session is None:
+            raise ValueError(f"server '{server}' is not connected")
+        return up.session
 
     async def call(self, key: str, arguments: dict):
         """Route a namespaced tool call to the server that owns it."""
         if key not in self.registry:
             raise ValueError(f"unknown tool: {key}")
         server, tool_name, _ = self.registry[key]
-        up = self.upstreams.get(server)
-        if up is None or up.session is None:
-            raise ValueError(f"server '{server}' is not connected")
-        return await up.session.call_tool(tool_name, arguments)
+        return await self._session_for(server).call_tool(tool_name, arguments)
+
+    async def read_resource(self, uri: str) -> str:
+        """Read a gateway resource and return its text."""
+        if uri not in self.resource_map:
+            raise ValueError(f"unknown resource: {uri}")
+        server, original = self.resource_map[uri]
+        result = await self._session_for(server).read_resource(original)
+        return "\n".join(c.text for c in result.contents if hasattr(c, "text"))
+
+    async def get_prompt(self, name: str, arguments: dict | None):
+        """Route a namespaced prompt request to the server that owns it."""
+        if name not in self.prompt_map:
+            raise ValueError(f"unknown prompt: {name}")
+        server, original = self.prompt_map[name]
+        return await self._session_for(server).get_prompt(original, arguments or None)
+
+    def list_resources(self) -> list[types.Resource]:
+        return list(self.resource_defs.values())
+
+    def list_prompts(self) -> list[types.Prompt]:
+        return list(self.prompt_defs.values())
 
     def exposed_tools(self) -> list[types.Tool]:
         """Tools as the gateway advertises them to MCP clients, with namespaced names."""
@@ -142,6 +210,8 @@ class UpstreamManager:
                 "status": u.status,
                 "error": u.error,
                 "tools": len(u.tools),
+                "resources": len(u.resources),
+                "prompts": len(u.prompts),
                 "config": {k: v for k, v in u.config.items() if k != "env"},
             }
             for u in self.upstreams.values()

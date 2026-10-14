@@ -20,5 +20,18 @@ def list_notes() -> str:
     return "\n".join(f"{i + 1}. {n}" for i, n in enumerate(notes))
 
 
+@mcp.resource("notes://latest")
+def latest_note() -> str:
+    """The most recently saved note."""
+    return notes[-1] if notes else "no notes yet"
+
+
+@mcp.prompt()
+def summarize_notes() -> str:
+    """Ask the model to summarize every saved note."""
+    body = "\n".join(notes) if notes else "(no notes)"
+    return f"Summarize these notes:\n{body}"
+
+
 if __name__ == "__main__":
     mcp.run()
