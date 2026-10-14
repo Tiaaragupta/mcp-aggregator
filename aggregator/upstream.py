@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
+
+from aggregator.secrets import get_secret
 
 SEP = "__"                # separates server name from tool/prompt name
 RES_PREFIX = "agg://"     # resource URIs become agg://<server>/<original uri>
@@ -65,6 +67,9 @@ class UpstreamManager:
             raise ValueError(f"server name may not contain '{SEP}'")
         if name in self.upstreams:
             raise ValueError(f"'{name}' already exists")
+        secret_name = cfg.get("secret")
+        if secret_name and get_secret(secret_name) is None:
+            raise ValueError(f"missing secret '{secret_name}' (add it to .env)")
 
         up = Upstream(name, cfg, stop=asyncio.Event())
         self.upstreams[name] = up
@@ -100,7 +105,13 @@ class UpstreamManager:
         """Owns the connection for one server. Entering and exiting happen in this one task."""
         try:
             cfg = up.config
-            params = StdioServerParameters(command=cfg["command"], args=cfg.get("args", []))
+            # Start from the normal environment, then inject this server's secret only
+            env = dict(get_default_environment())
+            if cfg.get("secret"):
+                env["MCP_TOKEN"] = get_secret(cfg["secret"])
+            params = StdioServerParameters(
+                command=cfg["command"], args=cfg.get("args", []), env=env
+            )
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
@@ -238,6 +249,7 @@ class UpstreamManager:
         ]
 
     def status(self) -> list[dict]:
+        # Shows which secret a server uses, never its value
         return [
             {
                 "name": u.name,

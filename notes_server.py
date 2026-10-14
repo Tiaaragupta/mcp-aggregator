@@ -1,3 +1,5 @@
+import os
+
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("notes")
@@ -18,6 +20,13 @@ def list_notes() -> str:
     if not notes:
         return "no notes yet"
     return "\n".join(f"{i + 1}. {n}" for i, n in enumerate(notes))
+
+
+@mcp.tool()
+def auth_status() -> str:
+    """Report whether the gateway passed this server a token. Never reveals the token."""
+    token = os.environ.get("MCP_TOKEN")
+    return f"token present (length {len(token)})" if token else "no token received"
 
 
 @mcp.resource("notes://latest")
