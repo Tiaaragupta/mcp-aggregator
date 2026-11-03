@@ -5,117 +5,134 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MCP Aggregator</title>
 <style>
-  body { font-family: system-ui, sans-serif; background: #0b1120; color: #e2e8f0; margin: 0; padding: 2rem; }
-  h1 { margin: 0 0 0.25rem; }
-  .sub { color: #94a3b8; margin-bottom: 2rem; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; max-width: 1100px; }
-  .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 1.25rem; }
-  h2 { font-size: 1rem; margin: 0 0 1rem; }
-  .tool { display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 0.75rem;
-          border: 1px solid #1e293b; border-radius: 8px; margin-bottom: 0.5rem; cursor: pointer; font-family: monospace; }
-  .tool:hover, .tool.active { border-color: #6366f1; background: #1e1b4b; }
-  .badge { font-size: 0.7rem; color: #a5b4fc; }
-  textarea { width: 100%; height: 110px; background: #020617; color: #e2e8f0; border: 1px solid #1e293b;
-             border-radius: 8px; padding: 0.6rem; font-family: monospace; box-sizing: border-box; }
-  button { margin-top: 0.75rem; background: #6366f1; color: white; border: 0; border-radius: 8px;
-           padding: 0.6rem 1.2rem; font-weight: 600; cursor: pointer; }
-  button:hover { background: #4f46e5; }
-  pre { background: #020617; border-radius: 8px; padding: 0.75rem; white-space: pre-wrap; min-height: 3rem; }
-  .ok { color: #34d399; } .err { color: #f87171; }
-  .log { font-family: monospace; font-size: 0.8rem; max-height: 300px; overflow-y: auto; }
-  .log div { padding: 0.25rem 0; border-bottom: 1px solid #1e293b; }
-  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  :root{--bg:#0f1320;--panel:#171c2e;--line:#262d47;--text:#e7eaf6;--mute:#8d96b8;--ok:#3ddc97;--bad:#ff6b6b;--acc:#7c9cff;--warn:#ffc857}
+  @media (prefers-color-scheme: light){:root{--bg:#f4f6fc;--panel:#fff;--line:#dfe3f1;--text:#161a2b;--mute:#5d6685;--acc:#3b5bdb}}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+  header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
+  h1{margin:0;font-size:18px} .sub{color:var(--mute)}
+  main{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;padding:16px 24px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  section.wide{grid-column:1/-1}
+  h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0}
+  input,select,button{font:inherit;padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+  input{flex:1;min-width:120px} button{cursor:pointer;background:var(--acc);color:#fff;border:0}
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+  button.danger{background:var(--bad)}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--bad)} .dot.ok{background:var(--ok)}
+  .srv{border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
+  .srv .name{font-weight:600} .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+  .chip{font:12px ui-monospace,Consolas,monospace;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:var(--mute)}
+  pre{margin:8px 0 0;padding:10px;background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:auto;max-height:240px;font:12px ui-monospace,Consolas,monospace}
+  #feed{max-height:260px;overflow:auto;font:12px ui-monospace,Consolas,monospace}
+  #feed div{padding:2px 0;border-bottom:1px solid var(--line)}
+  .tag{color:var(--acc)} .err{color:var(--bad)} .good{color:var(--ok)}
+  #ws{margin-left:auto}
 </style>
 </head>
 <body>
-<h1>MCP Aggregator</h1>
-<div class="sub">One endpoint, many servers. Click a tool, edit its arguments, and run it.</div>
+<header>
+  <h1>MCP Aggregator</h1><span class="sub">dynamic router &amp; gateway for MCP servers</span>
+  <span id="ws" class="sub"><span class="dot" id="wsdot"></span><span id="wstxt">connecting…</span></span>
+</header>
+<main>
+  <section class="wide">
+    <div class="row" style="justify-content:space-between"><h2 style="margin:0">Servers</h2><button class="ghost" onclick="checkHealth()">Run health check</button></div>
+    <div id="servers"></div>
+    <div class="row">
+      <input id="ns-name" placeholder="name (e.g. demo2)">
+      <input id="ns-cmd" placeholder="command (e.g. python)" value="python">
+      <input id="ns-args" placeholder="args, space separated (e.g. demo_server/echo_server.py)">
+      <input id="ns-secret" placeholder="secret name (optional)">
+      <button onclick="addServer()">Add server</button>
+    </div>
+    <div id="srv-msg" class="sub"></div>
+  </section>
 
-<div class="grid">
-  <div class="card">
-    <h2>Namespaced tools</h2>
-    <div id="tools"></div>
-  </div>
+  <section>
+    <h2>Smart route</h2>
+    <div class="row"><input id="rq" placeholder='Describe what you want, e.g. "save a note"'><button onclick="route(false)">Find tool</button></div>
+    <div class="row"><input id="rargs" placeholder='arguments as JSON, e.g. {"text":"hi"}'><button class="ghost" onclick="route(true)">Find &amp; run</button></div>
+    <pre id="rout">—</pre>
+  </section>
 
-  <div class="card">
-    <h2>Playground</h2>
-    <div id="selected" class="badge">Select a tool on the left</div>
-    <textarea id="args">{}</textarea>
-    <button id="run">Run tool</button>
-    <pre id="out"></pre>
-  </div>
+  <section>
+    <h2>Call a tool</h2>
+    <div class="row"><select id="tool" style="flex:1;min-width:0;max-width:100%;text-overflow:ellipsis"></select></div>
+    <div class="row"><input id="targs" placeholder='{"a": 2, "b": 3}' value='{}'><button onclick="callTool()">Call</button><button class="ghost" onclick="fanout()">Fan-out</button></div>
+    <pre id="tout">—</pre>
+  </section>
 
-  <div class="card" style="grid-column: 1 / -1;">
-    <h2>Call log</h2>
-    <div id="log" class="log"></div>
-  </div>
-</div>
+  <section>
+    <h2>Resources &amp; prompts</h2>
+    <div id="res" class="chips"></div>
+    <div id="prm" class="chips" style="margin-top:10px"></div>
+  </section>
 
+  <section class="wide">
+    <h2>Live trace feed (WebSocket)</h2>
+    <div id="feed"></div>
+  </section>
+</main>
 <script>
-let current = null;
+const $ = id => document.getElementById(id);
+const api = (path, opts) => fetch(path, opts).then(async r => { const t = await r.text(); let j; try{j=JSON.parse(t)}catch{j=t}; if(!r.ok) throw new Error(j.detail||t); return j; });
+const post = (p, b) => api(p, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(b)});
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const show = (el, v) => el.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
 
-async function loadTools() {
-  const res = await fetch("/tools");
-  const data = await res.json();
-  const box = document.getElementById("tools");
-  box.innerHTML = "";
-  data.tools.forEach(name => {
-    const row = document.createElement("div");
-    row.className = "tool";
-    row.innerHTML = `<span>${name}</span><span class="badge">${name.split("__")[0]}</span>`;
-    row.onclick = () => selectTool(name, row);
-    box.appendChild(row);
-  });
+async function load(){
+  const servers = await api('/servers');
+  $('servers').innerHTML = servers.map(s => `
+    <div class="srv">
+      <span class="dot ${s.healthy?'ok':''}"></span><span class="name">${esc(s.name)}</span>
+      <span class="sub"> ${s.healthy?'healthy':'DOWN'}${s.last_latency_ms!=null?' · ping '+s.last_latency_ms+' ms':''}${s.has_secret?' · 🔒 auth':''}</span>
+      <button class="danger" style="float:right" onclick="removeServer('${esc(s.name)}')">Remove</button>
+      ${s.last_error?`<div class="err">${esc(s.last_error)}</div>`:''}
+      <div class="chips">${s.tools.map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</div>
+    </div>`).join('') || '<div class="sub">No servers connected.</div>';
+  const tools = await api('/tools');
+  const cur = $('tool').value;
+  $('tool').innerHTML = tools.map(t => `<option value="${esc(t.name)}">${esc(t.name)} — ${esc(t.description||'')}</option>`).join('');
+  if (cur) $('tool').value = cur;
+  const [r, p] = await Promise.all([api('/resources'), api('/prompts')]);
+  $('res').innerHTML = '<span class="sub">Resources:</span> ' + (r.map(x=>`<span class="chip">${esc(x.uri)}</span>`).join('') || '<span class="sub">none</span>');
+  $('prm').innerHTML = '<span class="sub">Prompts:</span> ' + (p.map(x=>`<span class="chip">${esc(x.name)}</span>`).join('') || '<span class="sub">none</span>');
 }
-
-function selectTool(name, row) {
-  current = name;
-  document.querySelectorAll(".tool").forEach(r => r.classList.remove("active"));
-  row.classList.add("active");
-  document.getElementById("selected").textContent = "Selected: " + name;
-  const templates = {
-    "demo__add": { a: 2, b: 3 },
-    "demo__echo": { text: "hello" },
-    "notes__save_note": { text: "buy milk" },
-  };
-  document.getElementById("args").value = JSON.stringify(templates[name] || {}, null, 2);
+async function checkHealth(){ await api('/health/check',{method:'POST'}); load(); }
+async function addServer(){
+  const body = {name:$('ns-name').value.trim(), command:$('ns-cmd').value.trim(), args:$('ns-args').value.trim().split(/\s+/).filter(Boolean)};
+  if ($('ns-secret').value.trim()) body.secret = $('ns-secret').value.trim();
+  $('srv-msg').textContent = 'connecting…';
+  try { await post('/servers', body); $('srv-msg').textContent = 'added ' + body.name; load(); }
+  catch(e){ $('srv-msg').innerHTML = `<span class="err">${esc(e.message)}</span>`; }
 }
-
-function addLog(text, ok) {
-  const div = document.createElement("div");
-  div.className = ok ? "ok" : "err";
-  div.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
-  document.getElementById("log").prepend(div);
+async function removeServer(n){ await api('/servers/'+encodeURIComponent(n),{method:'DELETE'}); load(); }
+function parseArgs(id){ try{ return JSON.parse($(id).value||'{}'); }catch{ throw new Error('arguments must be valid JSON'); } }
+async function callTool(){
+  try{ show($('tout'), await post('/call',{tool:$('tool').value, arguments:parseArgs('targs')})); }catch(e){ show($('tout'), 'Error: '+e.message); }
 }
-
-document.getElementById("run").onclick = async () => {
-  if (!current) { alert("Select a tool first"); return; }
-  const out = document.getElementById("out");
-  let args;
-  try { args = JSON.parse(document.getElementById("args").value || "{}"); }
-  catch (e) { out.textContent = "Invalid JSON: " + e.message; return; }
-
-  out.textContent = "running...";
-  const res = await fetch("/call", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ tool: current, arguments: args }),
-  });
-  const data = await res.json();
-
-  if (!res.ok) {
-    out.textContent = "Error: " + data.detail;
-    out.className = "err";
-    addLog(`${current} -> ${data.detail}`, false);
-    return;
-  }
-  const text = data.content.map(c => c.text).join("\n");
-  out.textContent = text;
-  out.className = data.ok ? "ok" : "err";
-  addLog(`${current} -> ${text}`, data.ok);
-};
-
-loadTools();
+async function fanout(){
+  const t = $('tool').value.split('__').slice(1).join('__');
+  try{ show($('tout'), await post('/fanout',{tool:t, arguments:parseArgs('targs')})); }catch(e){ show($('tout'), 'Error: '+e.message); }
+}
+async function route(execute){
+  try{ show($('rout'), await post('/route',{query:$('rq').value, execute, arguments:parseArgs('rargs')})); }catch(e){ show($('rout'),'Error: '+e.message); }
+}
+function feed(ev){
+  const d = document.createElement('div');
+  d.innerHTML = `<span class="tag">${esc(ev.hop)}</span> ${esc(ev.tool||'')} <span class="${ev.ok?'good':'err'}">${ev.ok?'ok':'fail'}</span> ${ev.latency_ms}ms <span class="sub">${esc(ev.trace_id)}</span>`;
+  $('feed').prepend(d);
+  while ($('feed').children.length > 80) $('feed').lastChild.remove();
+}
+function connectWS(){
+  const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+  ws.onopen = () => { $('wsdot').className='dot ok'; $('wstxt').textContent='live'; };
+  ws.onclose = () => { $('wsdot').className='dot'; $('wstxt').textContent='reconnecting…'; setTimeout(connectWS, 2000); };
+  ws.onmessage = m => { const ev = JSON.parse(m.data); if (ev.hop) feed(ev); };
+}
+load(); connectWS(); setInterval(load, 15000);
 </script>
 </body>
 </html>

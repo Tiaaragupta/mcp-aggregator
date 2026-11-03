@@ -1,33 +1,20 @@
-import asyncio
-import json
-from pathlib import Path
+import pytest
 
-from aggregator.upstream import UpstreamManager
-
-ROOT = Path(__file__).resolve().parent.parent
-NOTES = {"command": "python", "args": [str(ROOT / "notes_server.py")]}
+pytestmark = pytest.mark.anyio
 
 
-def test_resource_and_prompt_are_forwarded(tmp_path):
-    path = tmp_path / "servers.json"
-    path.write_text(json.dumps({"servers": {"notes": NOTES}, "policy": {"block": []}}))
+async def test_resource_listed_with_agg_uri(manager):
+    assert "agg://notes/notes://latest" in manager.resources
 
-    async def main():
-        manager = UpstreamManager(str(path))
-        await manager.start()
-        try:
-            uris = [str(r.uri) for r in manager.list_resources()]
-            assert "agg://notes/notes://latest" in uris
 
-            text = await manager.read_resource("agg://notes/notes://latest")
-            assert text == "no notes yet"
+async def test_resource_read_reflects_state(manager):
+    await manager.call("notes__save_note", {"text": "hello resource"})
+    res = await manager.read_resource("agg://notes/notes://latest")
+    assert res.contents[0].text == "hello resource"
 
-            names = [p.name for p in manager.list_prompts()]
-            assert "notes__summarize_notes" in names
 
-            result = await manager.get_prompt("notes__summarize_notes", None)
-            assert len(result.messages) >= 1
-        finally:
-            await manager.close()
-
-    asyncio.run(main())
+async def test_prompt_listed_and_fetched(manager):
+    assert "notes__summarize_notes" in manager.prompts
+    await manager.call("notes__save_note", {"text": "alpha"})
+    p = await manager.get_prompt("notes__summarize_notes")
+    assert "alpha" in p.messages[0].content.text

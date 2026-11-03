@@ -1,60 +1,30 @@
-import asyncio
-import json
-from pathlib import Path
-
 import pytest
 
-from aggregator.upstream import UpstreamManager
-
-ROOT = Path(__file__).resolve().parent.parent
-
-DEMO = {"command": "python", "args": [str(ROOT / "demo_server" / "echo_server.py")]}
-NOTES = {"command": "python", "args": [str(ROOT / "notes_server.py")]}
+pytestmark = pytest.mark.anyio
 
 
-def write_config(tmp_path, servers):
-    path = tmp_path / "servers.json"
-    path.write_text(json.dumps({"servers": servers, "policy": {"block": []}}))
-    return str(path)
+async def test_add_and_remove_server_at_runtime(manager):
+    await manager.add_server("demo2", {"command": "python", "args": ["demo_server/echo_server.py"]})
+    assert "demo2__add" in {k for k, _ in manager.exposed_tools()}
+    res = await manager.call("demo2__add", {"a": 10, "b": 5})
+    assert res.content[0].text == "15"
+
+    await manager.remove_server("demo2")
+    assert "demo2__add" not in {k for k, _ in manager.exposed_tools()}
 
 
-def test_remove_then_readd_server(tmp_path):
-    config = write_config(tmp_path, {"demo": DEMO, "notes": NOTES})
-
-    async def main():
-        manager = UpstreamManager(config)
-        await manager.start()
-        try:
-            assert "notes__save_note" in manager.list_tools()
-
-            await manager.remove_server("notes")
-            assert not any(t.startswith("notes__") for t in manager.list_tools())
-
-            await manager.add_server("notes", NOTES)
-            assert "notes__save_note" in manager.list_tools()
-
-            result = await manager.call("notes__save_note", {"text": "hi"})
-            assert result.content[0].text.startswith("saved note")
-        finally:
-            await manager.close()
-
-    asyncio.run(main())
+async def test_duplicate_server_rejected(manager):
+    with pytest.raises(ValueError):
+        await manager.add_server("demo", {"command": "python", "args": ["demo_server/echo_server.py"]})
 
 
-def test_bad_server_is_rejected(tmp_path):
-    config = write_config(tmp_path, {"demo": DEMO})
+async def test_bad_server_fails_cleanly(manager):
+    with pytest.raises(RuntimeError):
+        await manager.add_server("broken", {"command": "definitely-not-a-real-command"})
+    assert "broken" not in manager.upstreams
 
-    async def main():
-        manager = UpstreamManager(config)
-        await manager.start()
-        try:
-            with pytest.raises(ValueError):
-                await manager.add_server(
-                    "broken", {"command": "definitely-not-a-real-command", "args": []}
-                )
-            assert "broken" not in manager.upstreams
-            assert not any(t.startswith("broken__") for t in manager.list_tools())
-        finally:
-            await manager.close()
 
-    asyncio.run(main())
+async def test_rediscover_keeps_tools(manager):
+    before = {k for k, _ in manager.exposed_tools()}
+    await manager.rediscover()
+    assert {k for k, _ in manager.exposed_tools()} == before

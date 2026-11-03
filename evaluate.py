@@ -1,125 +1,127 @@
+"""Produces the numeric results for the report. Run:  python evaluate.py
+
+Measures discovery time, call latency (p50/p95), routing accuracy, fan-out time,
+failure-recovery time, and the pytest pass count. Writes results/results.json and results/results.md.
+"""
 import asyncio
 import json
+import os
 import statistics
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
-from aggregator.upstream import UpstreamManager
+os.environ.setdefault("NOTES_TOKEN", "eval-token")
+from aggregator.router import Router  # noqa: E402
+from aggregator.upstream import UpstreamManager  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
-DEMO = {"command": "python", "args": [str(ROOT / "demo_server" / "echo_server.py")]}
-NOTES = {"command": "python", "args": [str(ROOT / "notes_server.py")]}
+N_CALLS = 100
+
+ROUTING_SET = [
+    ("save this note for later", "notes__save_note"),
+    ("show me all my notes", "notes__list_notes"),
+    ("add two numbers together", "demo__add"),
+    ("echo back this text", "demo__echo"),
+    ("remember a note", "notes__save_note"),
+    ("list saved notes", "notes__list_notes"),
+    ("sum of numbers", "demo__add"),
+    ("repeat the text", "demo__echo"),
+    ("check authentication status", "notes__auth_status"),
+    ("is a token present", "notes__auth_status"),
+]
 
 
-class DeadSession:
-    """Simulates a crashed server: every request fails."""
-
-    async def list_tools(self):
-        raise ConnectionError("server went away")
-
-
-def ms(seconds):
-    return round(seconds * 1000, 2)
+def pct(values, p):
+    s = sorted(values)
+    return s[min(len(s) - 1, int(round(p / 100 * (len(s) - 1))))]
 
 
 async def main():
-    tmp = Path(tempfile.mkdtemp())
-    cfg = tmp / "servers.json"
-    cfg.write_text(json.dumps({
-        "servers": {"demo": DEMO, "notes": NOTES},
-        "policy": {"block": ["*delete*"]},
-    }))
+    out = {}
+    cfg = json.loads((ROOT / "servers.json").read_text())
+    cfg["servers"]["demo2"] = {"command": "python", "args": ["demo_server/echo_server.py"]}
+    tmp = Path(tempfile.mkdtemp()) / "servers.json"
+    tmp.write_text(json.dumps(cfg))
 
-    m = UpstreamManager(str(cfg))
-    r = {}
-
-    # 1. Startup and discovery
+    m = UpstreamManager(str(tmp))
     t = time.perf_counter()
     await m.start()
-    r["startup_seconds"] = round(time.perf_counter() - t, 2)
-    r["servers_connected"] = len(m.upstreams)
-    r["tools_exposed"] = len(m.list_tools())
-    r["resources_exposed"] = len(m.list_resources())
-    r["prompts_exposed"] = len(m.list_prompts())
+    out["discovery_ms"] = round((time.perf_counter() - t) * 1000)
+    out["servers"] = len(m.upstreams)
+    out["tools_exposed"] = len(m.registry)
+    out["policy_patterns"] = cfg["policy"]["block"]
+    out["resources"] = len(m.resources)
+    out["prompts"] = len(m.prompts)
 
-    try:
-        # 2. Routing correctness: 40 calls across two servers
-        correct = total = 0
-        for i in range(10):
-            checks = [
-                ("demo__add", {"a": i, "b": i + 1}, lambda x, i=i: x == str(2 * i + 1)),
-                ("demo__echo", {"text": f"msg{i}"}, lambda x, i=i: x == f"msg{i}"),
-                ("notes__save_note", {"text": f"n{i}"}, lambda x: x.startswith("saved note")),
-                ("notes__list_notes", {}, lambda x: "n" in x),
-            ]
-            for tool, args, ok in checks:
-                res = await m.call(tool, args)
-                total += 1
-                correct += 1 if ok(res.content[0].text) else 0
-        r["routing_correct"] = f"{correct}/{total}"
-        r["routing_accuracy_pct"] = round(100 * correct / total, 1)
+    # call latency through the aggregator
+    lat = []
+    for i in range(N_CALLS):
+        s = time.perf_counter()
+        r = await m.call("demo__add", {"a": i, "b": 1})
+        assert r.content[0].text == str(i + 1)
+        lat.append((time.perf_counter() - s) * 1000)
+    out["call_latency_ms"] = {
+        "n": N_CALLS, "mean": round(statistics.mean(lat), 2), "p50": round(pct(lat, 50), 2),
+        "p95": round(pct(lat, 95), 2), "max": round(max(lat), 2),
+    }
 
-        # 3. Latency and throughput: 100 calls through the gateway
-        times = []
-        start = time.perf_counter()
-        for i in range(100):
-            t = time.perf_counter()
-            await m.call("demo__add", {"a": i, "b": 1})
-            times.append(time.perf_counter() - t)
-        elapsed = time.perf_counter() - start
-        times.sort()
-        r["latency_avg_ms"] = ms(statistics.mean(times))
-        r["latency_p50_ms"] = ms(times[49])
-        r["latency_p95_ms"] = ms(times[94])
-        r["latency_max_ms"] = ms(times[-1])
-        r["throughput_calls_per_sec"] = round(100 / elapsed, 1)
+    # routing accuracy
+    router = Router(m)
+    hits = 0
+    for q, want in ROUTING_SET:
+        got = router.route(q, 1)["matches"]
+        # overlapping servers expose the same tool; either copy counts as correct
+        hits += bool(got) and got[0]["tool"].split("__", 1)[1] == want.split("__", 1)[1]
+    out["routing"] = {"cases": len(ROUTING_SET), "correct": hits, "accuracy_pct": round(100 * hits / len(ROUTING_SET), 1)}
 
-        # 4. Policy enforcement
-        blocked_hidden = "demo__delete_note" not in m.list_tools()
-        try:
-            await m.call("demo__delete_note", {"note_id": "1"})
-            blocked_rejected = False
-        except ValueError:
-            blocked_rejected = True
-        r["policy_hides_blocked_tool"] = blocked_hidden
-        r["policy_rejects_blocked_call"] = blocked_rejected
+    # fan-out aggregation across overlapping servers
+    s = time.perf_counter()
+    fan = await m.call_all("echo", {"text": "hi"})
+    out["fanout"] = {"sources": fan["sources"], "ms": round((time.perf_counter() - s) * 1000, 2)}
 
-        # 5. Failure detection and recovery
-        m.upstreams["notes"].session = DeadSession()
-        t = time.perf_counter()
-        health = await m.health_check()
-        r["failure_detected"] = health["notes"].startswith("unhealthy")
-        r["failure_detection_ms"] = ms(time.perf_counter() - t)
-        r["dead_server_tools_removed"] = not any(k.startswith("notes__") for k in m.list_tools())
-        r["healthy_server_unaffected"] = "demo__add" in m.list_tools()
+    # health check + recovery
+    s = time.perf_counter()
+    healthy = await m.health_check()
+    out["health_check_ms"] = round((time.perf_counter() - s) * 1000, 2)
+    out["all_healthy"] = all(healthy.values())
 
-        await m.remove_server("notes")
-        t = time.perf_counter()
-        await m.add_server("notes", NOTES)
-        r["recovery_readd_seconds"] = round(time.perf_counter() - t, 2)
-        r["tools_after_recovery"] = len(m.list_tools())
+    up = m.upstreams["demo"]
+    up.stop.set()
+    await up.task
+    s = time.perf_counter()
+    res = await m.health_check()
+    out["recovery"] = {"recovered": res["demo"], "ms": round((time.perf_counter() - s) * 1000)}
+    await m.close()
 
-        # 6. Runtime add and remove
-        t = time.perf_counter()
-        await m.remove_server("demo")
-        r["runtime_remove_ms"] = ms(time.perf_counter() - t)
-        t = time.perf_counter()
-        await m.add_server("demo", DEMO)
-        r["runtime_add_seconds"] = round(time.perf_counter() - t, 2)
-    finally:
-        await m.close()
+    # test suite
+    p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                       capture_output=True, text=True, cwd=ROOT)
+    summary = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else "no output"
+    out["pytest"] = {"exit_code": p.returncode, "summary": summary}
 
-    # Print results
-    print("\n" + "=" * 56)
-    print(" MCP AGGREGATOR - EVALUATION RESULTS")
-    print("=" * 56)
-    for key, value in r.items():
-        print(f" {key:<32} {value}")
-    print("=" * 56)
+    (ROOT / "results").mkdir(exist_ok=True)
+    (ROOT / "results" / "results.json").write_text(json.dumps(out, indent=2))
+    c = out["call_latency_ms"]
+    md = f"""# Evaluation results
 
-    Path("results.json").write_text(json.dumps(r, indent=2))
-    print(" saved to results.json\n")
+| Metric | Value |
+|---|---|
+| Downstream servers connected | {out['servers']} |
+| Tools exposed after policy | {out['tools_exposed']} |
+| Resources / prompts aggregated | {out['resources']} / {out['prompts']} |
+| Initial discovery time | {out['discovery_ms']} ms |
+| Tool call latency (n={c['n']}) | mean {c['mean']} ms, p50 {c['p50']} ms, p95 {c['p95']} ms, max {c['max']} ms |
+| Routing accuracy | {out['routing']['correct']}/{out['routing']['cases']} ({out['routing']['accuracy_pct']}%) |
+| Fan-out across overlapping servers | {out['fanout']['sources']} sources in {out['fanout']['ms']} ms |
+| Health check (all servers) | {out['health_check_ms']} ms, all healthy: {out['all_healthy']} |
+| Failure recovery (killed server restarted) | recovered: {out['recovery']['recovered']} in {out['recovery']['ms']} ms |
+| Test suite | {out['pytest']['summary']} |
+"""
+    (ROOT / "results" / "results.md").write_text(md)
+    print(md)
 
 
 if __name__ == "__main__":

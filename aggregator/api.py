@@ -1,84 +1,186 @@
+"""HTTP + WebSocket API (FastAPI). On AWS this sits behind API Gateway / an ALB."""
+import asyncio
+import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from aggregator.tracing import traced_call
-from aggregator.upstream import UpstreamManager
+from . import tracing
+from .router import Router
+from .store import SCHEMA_VERSION, store_from_env
+from .upstream import UpstreamManager
 
-manager = UpstreamManager("servers.json")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await manager.start()
-    manager.start_health_loop(interval=30)
-    yield
-    await manager.close()
+FRONTEND = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
 
 
-app = FastAPI(title="MCP Aggregator", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-class CallIn(BaseModel):
+class CallBody(BaseModel):
     tool: str
     arguments: dict = {}
 
 
-class ServerIn(BaseModel):
+class ServerBody(BaseModel):
     name: str
     command: str
     args: list[str] = []
+    secret: str | None = None
 
 
-@app.get("/")
-def dashboard():
-    return FileResponse("frontend/index.html")
+class RouteBody(BaseModel):
+    query: str
+    top_k: int = 3
+    execute: bool = False
+    arguments: dict = {}
 
 
-@app.get("/tools")
-def list_tools():
-    return {"tools": manager.list_tools()}
+class FanoutBody(BaseModel):
+    tool: str
+    arguments: dict = {}
 
 
-@app.post("/call")
-async def call_tool(body: CallIn):
-    try:
-        result = await traced_call(manager, body.tool, body.arguments, source="dashboard")
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return {
-        "ok": not result.isError,
-        "content": [c.model_dump() for c in result.content],
-    }
+def create_app(manager: UpstreamManager | None = None, bedrock_client=None, health_interval: float | None = 30.0) -> FastAPI:
+    import os
+
+    mgr = manager or UpstreamManager(store=store_from_env())
+    model_id = os.environ.get("BEDROCK_MODEL_ID")
+    if bedrock_client is None and model_id:
+        import boto3
+
+        bedrock_client = boto3.client("bedrock-runtime")
+    router = Router(mgr, bedrock_client=bedrock_client, **({"model_id": model_id} if model_id else {}))
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        tracing.configure_from_env()
+        if not mgr.upstreams:
+            await mgr.start()
+        if health_interval:
+            mgr.start_health_loop(health_interval)
+        yield
+        await mgr.close()
+
+    app = FastAPI(title="MCP Aggregator", lifespan=lifespan)
+    app.state.manager = mgr
+    app.state.router = router
+
+    @app.get("/")
+    async def index():
+        if FRONTEND.exists():
+            return FileResponse(FRONTEND)
+        return {"service": "mcp-aggregator"}
+
+    @app.get("/healthz")
+    async def healthz():
+        return {"ok": True, "schema_version": SCHEMA_VERSION, "servers": len(mgr.upstreams)}
+
+    @app.get("/tools")
+    async def tools():
+        return [{"name": k, "description": t.description, "inputSchema": t.inputSchema} for k, t in mgr.exposed_tools()]
+
+    @app.post("/call")
+    async def call(body: CallBody):
+        try:
+            res = await tracing.traced_call(mgr, body.tool, body.arguments)
+        except KeyError as e:
+            raise HTTPException(404, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"{type(e).__name__}: {e}")
+        return {
+            "isError": res.isError,
+            "content": [c.model_dump() for c in res.content],
+        }
+
+    @app.post("/fanout")
+    async def fanout(body: FanoutBody):
+        try:
+            return await mgr.call_all(body.tool, body.arguments)
+        except KeyError as e:
+            raise HTTPException(404, str(e))
+
+    @app.post("/route")
+    async def route(body: RouteBody):
+        decision = router.route(body.query, body.top_k)
+        out = dict(decision)
+        if body.execute and decision["matches"]:
+            best = decision["matches"][0]["tool"]
+            res = await tracing.traced_call(mgr, best, body.arguments, source="router")
+            out["executed"] = best
+            out["result"] = [c.model_dump() for c in res.content]
+        return out
+
+    @app.get("/servers")
+    async def servers():
+        return mgr.status()
+
+    @app.post("/servers")
+    async def add_server(body: ServerBody):
+        cfg = {"command": body.command, "args": body.args}
+        if body.secret:
+            cfg["secret"] = body.secret
+        try:
+            await mgr.add_server(body.name, cfg)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+        return {"added": body.name}
+
+    @app.delete("/servers/{name}")
+    async def delete_server(name: str):
+        try:
+            await mgr.remove_server(name)
+        except KeyError:
+            raise HTTPException(404, f"no such server: {name}")
+        return {"removed": name}
+
+    @app.post("/health/check")
+    async def health_check():
+        return await mgr.health_check()
+
+    @app.post("/rediscover")
+    async def rediscover():
+        await mgr.rediscover()
+        return {"tools": len(mgr.registry)}
+
+    @app.get("/resources")
+    async def resources():
+        return [{"uri": k, "name": v[2].name} for k, v in mgr.resources.items()]
+
+    @app.get("/prompts")
+    async def prompts():
+        return [{"name": k, "description": v[2].description} for k, v in mgr.prompts.items()]
+
+    @app.websocket("/ws")
+    async def ws(socket: WebSocket):
+        """Live feed of trace events. Clients may also send {"tool":..., "arguments":...} to call a tool."""
+        await socket.accept()
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        tracing.SUBSCRIBERS.add(q)
+
+        async def pump():
+            while True:
+                await socket.send_text(json.dumps(await q.get(), default=str))
+
+        pump_task = asyncio.create_task(pump())
+        try:
+            while True:
+                msg = json.loads(await socket.receive_text())
+                try:
+                    res = await tracing.traced_call(mgr, msg["tool"], msg.get("arguments", {}), source="ws")
+                    reply = {"type": "result", "tool": msg["tool"], "isError": res.isError,
+                             "content": [c.model_dump() for c in res.content]}
+                except Exception as e:  # noqa: BLE001
+                    reply = {"type": "error", "error": f"{type(e).__name__}: {e}"}
+                await socket.send_text(json.dumps(reply, default=str))
+        except WebSocketDisconnect:
+            pass
+        finally:
+            pump_task.cancel()
+            tracing.SUBSCRIBERS.discard(q)
+
+    return app
 
 
-@app.get("/servers")
-def list_servers():
-    return {"servers": manager.status()}
-
-
-@app.post("/servers")
-async def add_server(body: ServerIn):
-    try:
-        await manager.add_server(body.name, {"command": body.command, "args": body.args})
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"ok": True, "tools": [t for t in manager.list_tools() if t.startswith(body.name + "__")]}
-
-
-@app.delete("/servers/{name}")
-async def remove_server(name: str):
-    try:
-        await manager.remove_server(name)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return {"ok": True}
-
-
-@app.post("/health/check")
-async def run_health_check():
-    return {"results": await manager.health_check()}
+app = create_app()

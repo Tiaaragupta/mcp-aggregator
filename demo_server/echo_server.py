@@ -17,7 +17,7 @@ def echo(text: str) -> str:
 
 @mcp.tool()
 def delete_note(note_id: str) -> str:
-    """Pretend to delete a note. The policy will block this later."""
+    """Pretend to delete a note. The policy will block this."""
     return f"deleted {note_id}"
 
 

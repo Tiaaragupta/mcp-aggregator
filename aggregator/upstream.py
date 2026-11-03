@@ -1,268 +1,58 @@
+"""Manages connections to downstream MCP servers.
+
+Each upstream runs in ONE long-lived asyncio task, because anyio requires a
+context to be entered and exited from the same task. An Event signals stop.
+"""
 import asyncio
 import fnmatch
 import json
+import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.stdio import get_default_environment, stdio_client
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-from aggregator.secrets import get_secret
+from .secrets import get_secret
+from .store import make_record
 
-SEP = "__"                # separates server name from tool/prompt name
-RES_PREFIX = "agg://"     # resource URIs become agg://<server>/<original uri>
-CONNECT_TIMEOUT = 15
-HEALTH_TIMEOUT = 5
-
-
-def log(msg):
-    # stdout is reserved for MCP messages in gateway mode, so log to stderr
-    print(msg, file=sys.stderr)
+ROOT = Path(__file__).resolve().parent.parent
+SEP = "__"
 
 
 @dataclass
 class Upstream:
     name: str
     config: dict
-    status: str = "starting"
-    health: str = "unknown"
-    error: str | None = None
+    task: asyncio.Task | None = None
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
     session: ClientSession | None = None
-    tools: list = field(default_factory=list)
-    resources: list = field(default_factory=list)
-    prompts: list = field(default_factory=list)
-    runner: asyncio.Task | None = None
-    stop: asyncio.Event | None = None
-
-
-def _drop(d: dict, prefix: str):
-    for key in [k for k in d if k.startswith(prefix)]:
-        del d[key]
+    healthy: bool = False
+    last_check: float = 0.0
+    last_error: str | None = None
+    last_latency_ms: float | None = None
 
 
 class UpstreamManager:
-    def __init__(self, config_path: str):
-        self.config_path = Path(config_path)
+    def __init__(self, config_path: str | None = None, store=None):
+        self.config_path = Path(config_path or os.environ.get("MCP_CONFIG") or ROOT / "servers.json")
+        self.store = store
         self.upstreams: dict[str, Upstream] = {}
-        self.registry = {}       # tool key -> (server, tool name, tool)
-        self.resource_defs = {}  # gateway uri -> types.Resource
-        self.resource_map = {}   # gateway uri -> (server, original uri)
-        self.prompt_defs = {}    # gateway prompt name -> types.Prompt
-        self.prompt_map = {}     # gateway prompt name -> (server, original name)
-        self.block: list[str] = []
+        # namespaced name -> (server, original name, Tool)
+        self.registry: dict[str, tuple[str, str, object]] = {}
+        self.resources: dict[str, tuple[str, str, object]] = {}   # agg uri -> (server, orig uri, Resource)
+        self.prompts: dict[str, tuple[str, str, object]] = {}     # server__name -> (server, name, Prompt)
+        self.policy_block: list[str] = []
         self._health_task: asyncio.Task | None = None
 
+    # ---------- lifecycle ----------
     async def start(self):
-        config = json.loads(self.config_path.read_text())
-        self.block = config.get("policy", {}).get("block", [])
-        for name, cfg in config["servers"].items():
-            try:
-                await self.add_server(name, cfg)
-            except ValueError as e:
-                log(f"could not connect '{name}': {e}")
-
-    async def add_server(self, name: str, cfg: dict) -> Upstream:
-        if SEP in name:
-            raise ValueError(f"server name may not contain '{SEP}'")
-        if name in self.upstreams:
-            raise ValueError(f"'{name}' already exists")
-        secret_name = cfg.get("secret")
-        if secret_name and get_secret(secret_name) is None:
-            raise ValueError(f"missing secret '{secret_name}' (add it to .env)")
-
-        up = Upstream(name, cfg, stop=asyncio.Event())
-        self.upstreams[name] = up
-        ready = asyncio.Event()
-        up.runner = asyncio.create_task(self._run(up, ready))
-        try:
-            await asyncio.wait_for(ready.wait(), CONNECT_TIMEOUT + 5)
-        except asyncio.TimeoutError:
-            up.error = "connect timed out"
-            up.stop.set()
-
-        if up.status != "connected":
-            self.upstreams.pop(name, None)
-            raise ValueError(up.error or "failed to connect")
-        up.health = "healthy"
-        log(f"connected to '{name}': {len(up.tools)} tools, "
-            f"{len(up.resources)} resources, {len(up.prompts)} prompts")
-        return up
-
-    async def remove_server(self, name: str):
-        up = self.upstreams.pop(name, None)
-        if up is None:
-            raise ValueError(f"unknown server: {name}")
-        up.stop.set()
-        try:
-            await asyncio.wait_for(up.runner, 5)
-        except Exception:
-            up.runner.cancel()
-        self._unindex(name)
-        log(f"removed '{name}'")
-
-    async def _run(self, up: Upstream, ready: asyncio.Event):
-        """Owns the connection for one server. Entering and exiting happen in this one task."""
-        try:
-            cfg = up.config
-            # Start from the normal environment, then inject this server's secret only
-            env = dict(get_default_environment())
-            if cfg.get("secret"):
-                env["MCP_TOKEN"] = get_secret(cfg["secret"])
-            params = StdioServerParameters(
-                command=cfg["command"], args=cfg.get("args", []), env=env
-            )
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
-                    up.session = session
-                    await self._refresh(up)
-                    up.status = "connected"
-                    ready.set()
-                    await up.stop.wait()  # stay connected until remove_server sets stop
-        except Exception as e:
-            up.status = "error"
-            up.error = f"{type(e).__name__}: {e}"
-            ready.set()
-        finally:
-            up.session = None
-            if up.status == "connected":
-                up.status = "disconnected"
-            self._unindex(up.name)
-
-    @staticmethod
-    async def _optional(fn, attr: str):
-        # Resources and prompts are optional in MCP, so a server may not have them
-        try:
-            return getattr(await fn(), attr)
-        except Exception:
-            return []
-
-    async def _refresh(self, up: Upstream):
-        """Re-discover tools, resources and prompts from one server and rebuild its entries."""
-        up.tools = (await up.session.list_tools()).tools
-        up.resources = await self._optional(up.session.list_resources, "resources")
-        up.prompts = await self._optional(up.session.list_prompts, "prompts")
-        self._unindex(up.name)
-        self._index(up)
-
-    async def health_check(self) -> dict:
-        """Ping every connected server. Re-discover on success, drop from the registry on failure."""
-        results = {}
-        for name, up in list(self.upstreams.items()):
-            if up.session is None:
-                results[name] = "not connected"
-                continue
-            try:
-                await asyncio.wait_for(self._refresh(up), HEALTH_TIMEOUT)
-                up.health = "healthy"
-            except Exception as e:
-                up.health = f"unhealthy: {type(e).__name__}"
-                self._unindex(name)
-                log(f"health check failed for '{name}': {up.health}")
-            results[name] = up.health
-        return results
-
-    def start_health_loop(self, interval: float = 30):
-        self._health_task = asyncio.create_task(self._health_loop(interval))
-
-    async def _health_loop(self, interval: float):
-        while True:
-            await asyncio.sleep(interval)
-            await self.health_check()
-
-    def _blocked(self, key: str) -> bool:
-        return any(fnmatch.fnmatch(key, p) for p in self.block)
-
-    def _index(self, up: Upstream):
-        for tool in up.tools:
-            key = f"{up.name}{SEP}{tool.name}"
-            if not self._blocked(key):
-                self.registry[key] = (up.name, tool.name, tool)
-
-        for r in up.resources:
-            key = f"{RES_PREFIX}{up.name}/{r.uri}"
-            if not self._blocked(key):
-                self.resource_defs[key] = types.Resource(
-                    uri=key, name=r.name, description=r.description, mimeType=r.mimeType
-                )
-                self.resource_map[key] = (up.name, str(r.uri))
-
-        for p in up.prompts:
-            key = f"{up.name}{SEP}{p.name}"
-            if not self._blocked(key):
-                self.prompt_defs[key] = types.Prompt(
-                    name=key, description=p.description, arguments=p.arguments
-                )
-                self.prompt_map[key] = (up.name, p.name)
-
-    def _unindex(self, name: str):
-        _drop(self.registry, name + SEP)
-        _drop(self.prompt_defs, name + SEP)
-        _drop(self.prompt_map, name + SEP)
-        _drop(self.resource_defs, f"{RES_PREFIX}{name}/")
-        _drop(self.resource_map, f"{RES_PREFIX}{name}/")
-
-    def _session_for(self, server: str) -> ClientSession:
-        up = self.upstreams.get(server)
-        if up is None or up.session is None:
-            raise ValueError(f"server '{server}' is not connected")
-        return up.session
-
-    async def call(self, key: str, arguments: dict):
-        """Route a namespaced tool call to the server that owns it."""
-        if key not in self.registry:
-            raise ValueError(f"unknown tool: {key}")
-        server, tool_name, _ = self.registry[key]
-        return await self._session_for(server).call_tool(tool_name, arguments)
-
-    async def read_resource(self, uri: str) -> str:
-        """Read a gateway resource and return its text."""
-        if uri not in self.resource_map:
-            raise ValueError(f"unknown resource: {uri}")
-        server, original = self.resource_map[uri]
-        result = await self._session_for(server).read_resource(original)
-        return "\n".join(c.text for c in result.contents if hasattr(c, "text"))
-
-    async def get_prompt(self, name: str, arguments: dict | None):
-        """Route a namespaced prompt request to the server that owns it."""
-        if name not in self.prompt_map:
-            raise ValueError(f"unknown prompt: {name}")
-        server, original = self.prompt_map[name]
-        return await self._session_for(server).get_prompt(original, arguments or None)
-
-    def list_resources(self) -> list[types.Resource]:
-        return list(self.resource_defs.values())
-
-    def list_prompts(self) -> list[types.Prompt]:
-        return list(self.prompt_defs.values())
-
-    def exposed_tools(self) -> list[types.Tool]:
-        """Tools as the gateway advertises them to MCP clients, with namespaced names."""
-        return [
-            types.Tool(
-                name=key,
-                description=f"[{server}] {tool.description or ''}",
-                inputSchema=tool.inputSchema,
-            )
-            for key, (server, _, tool) in self.registry.items()
-        ]
-
-    def status(self) -> list[dict]:
-        # Shows which secret a server uses, never its value
-        return [
-            {
-                "name": u.name,
-                "status": u.status,
-                "health": u.health,
-                "error": u.error,
-                "tools": len(u.tools),
-                "resources": len(u.resources),
-                "prompts": len(u.prompts),
-                "config": {k: v for k, v in u.config.items() if k != "env"},
-            }
-            for u in self.upstreams.values()
-        ]
+        cfg = json.loads(self.config_path.read_text())
+        self.policy_block = cfg.get("policy", {}).get("block", [])
+        await asyncio.gather(*(self.add_server(n, c) for n, c in cfg.get("servers", {}).items()))
 
     async def close(self):
         if self._health_task:
@@ -270,5 +60,211 @@ class UpstreamManager:
         for name in list(self.upstreams):
             await self.remove_server(name)
 
-    def list_tools(self):
-        return list(self.registry.keys())
+    async def add_server(self, name: str, config: dict):
+        if name in self.upstreams:
+            raise ValueError(f"server '{name}' already exists")
+        up = Upstream(name=name, config=config)
+        self.upstreams[name] = up
+        up.task = asyncio.create_task(self._run(up))
+        try:
+            await asyncio.wait_for(up.ready.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+        if not up.healthy:
+            err = up.last_error or "timeout starting server"
+            await self.remove_server(name)
+            raise RuntimeError(f"could not start '{name}': {err}")
+        await self._refresh(up)
+        self._persist(up)
+
+    async def remove_server(self, name: str):
+        up = self.upstreams.pop(name, None)
+        if not up:
+            raise KeyError(name)
+        up.stop.set()
+        if up.task:
+            try:
+                await asyncio.wait_for(up.task, timeout=10)
+            except Exception:
+                up.task.cancel()
+        for table in (self.registry, self.resources, self.prompts):
+            for key in [k for k, v in table.items() if v[0] == name]:
+                del table[key]
+        if self.store:
+            self.store.delete(name)
+
+    async def _run(self, up: Upstream):
+        cfg = up.config
+        env = dict(os.environ)
+        env.update(cfg.get("env", {}))
+        secret_name = cfg.get("secret")
+        if secret_name:
+            value = get_secret(secret_name)
+            if value:
+                env["MCP_TOKEN"] = value  # injected, never logged or returned
+        cmd = cfg["command"]
+        if cmd == "python":
+            cmd = sys.executable
+        params = StdioServerParameters(command=cmd, args=cfg.get("args", []), env=env, cwd=str(ROOT))
+        try:
+            async with stdio_client(params) as (r, w):
+                async with ClientSession(r, w) as session:
+                    await session.initialize()
+                    up.session = session
+                    up.healthy = True
+                    up.ready.set()
+                    await up.stop.wait()
+        except Exception as e:  # noqa: BLE001
+            up.last_error = f"{type(e).__name__}: {e}"
+        finally:
+            up.healthy = False
+            up.session = None
+            up.ready.set()
+
+    # ---------- discovery ----------
+    def _blocked(self, key: str) -> bool:
+        return any(fnmatch.fnmatch(key, p) for p in self.policy_block)
+
+    async def _refresh(self, up: Upstream):
+        """Re-discover tools, resources and prompts for one upstream."""
+        for table in (self.registry, self.resources, self.prompts):
+            for key in [k for k, v in table.items() if v[0] == up.name]:
+                del table[key]
+        s = up.session
+        tools = (await s.list_tools()).tools
+        for t in tools:
+            key = f"{up.name}{SEP}{t.name}"
+            if not self._blocked(key):
+                self.registry[key] = (up.name, t.name, t)
+        try:
+            for r in (await s.list_resources()).resources:
+                self.resources[f"agg://{up.name}/{r.uri}"] = (up.name, str(r.uri), r)
+        except Exception:
+            pass
+        try:
+            for p in (await s.list_prompts()).prompts:
+                self.prompts[f"{up.name}{SEP}{p.name}"] = (up.name, p.name, p)
+        except Exception:
+            pass
+
+    def _persist(self, up: Upstream):
+        if self.store:
+            tools = [k for k, v in self.registry.items() if v[0] == up.name]
+            self.store.put(make_record(up.name, up.config, tools))
+
+    async def rediscover(self):
+        """Refresh every healthy upstream (what EventBridge triggers on AWS)."""
+        for up in list(self.upstreams.values()):
+            if up.healthy and up.session:
+                await self._refresh(up)
+                self._persist(up)
+
+    # ---------- health ----------
+    async def health_check(self) -> dict:
+        """Ping every upstream; mark failures; try one restart of dead ones."""
+        results = {}
+        for name, up in list(self.upstreams.items()):
+            start = time.perf_counter()
+            try:
+                if not up.session:
+                    raise RuntimeError(up.last_error or "not connected")
+                await asyncio.wait_for(up.session.send_ping(), timeout=5)
+                up.healthy, up.last_error = True, None
+            except Exception as e:  # noqa: BLE001
+                up.healthy = False
+                up.last_error = f"{type(e).__name__}: {e}" or "unreachable"
+                await self._restart(up)
+            up.last_latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            up.last_check = time.time()
+            results[name] = up.healthy
+        return results
+
+    async def _restart(self, up: Upstream):
+        """Replace a dead upstream's task with a fresh one."""
+        up.stop.set()
+        if up.task:
+            try:
+                await asyncio.wait_for(up.task, timeout=5)
+            except Exception:
+                up.task.cancel()
+        up.stop, up.ready = asyncio.Event(), asyncio.Event()
+        up.task = asyncio.create_task(self._run(up))
+        try:
+            await asyncio.wait_for(up.ready.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            return
+        if up.healthy:
+            await self._refresh(up)
+            self._persist(up)
+
+    def start_health_loop(self, interval: float = 30.0):
+        async def loop():
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.health_check()
+                except Exception:
+                    pass
+
+        self._health_task = asyncio.create_task(loop())
+
+    def status(self) -> list[dict]:
+        out = []
+        for name, up in self.upstreams.items():
+            out.append({
+                "name": name,
+                "healthy": up.healthy,
+                "tools": sorted(k for k, v in self.registry.items() if v[0] == name),
+                "resources": sorted(k for k, v in self.resources.items() if v[0] == name),
+                "prompts": sorted(k for k, v in self.prompts.items() if v[0] == name),
+                "has_secret": bool(up.config.get("secret")),   # never the value
+                "last_check": up.last_check or None,
+                "last_latency_ms": up.last_latency_ms,
+                "last_error": up.last_error,
+            })
+        return out
+
+    # ---------- calls ----------
+    def exposed_tools(self):
+        return [(k, v[2]) for k, v in self.registry.items()]
+
+    async def call(self, key: str, arguments: dict):
+        if key not in self.registry:
+            raise KeyError(f"unknown or blocked tool: {key}")
+        server, orig, _ = self.registry[key]
+        up = self.upstreams[server]
+        if not up.session:
+            raise RuntimeError(f"server '{server}' is not connected")
+        return await up.session.call_tool(orig, arguments)
+
+    async def call_all(self, tool_name: str, arguments: dict) -> dict:
+        """Fan-out: call every server that exposes `tool_name` in parallel and merge.
+
+        This is how overlapping capabilities are aggregated into one response.
+        """
+        keys = [k for k, v in self.registry.items() if v[1] == tool_name]
+        if not keys:
+            raise KeyError(f"no server exposes '{tool_name}'")
+
+        async def one(k):
+            try:
+                res = await self.call(k, arguments)
+                text = " ".join(getattr(c, "text", "") for c in res.content)
+                return k, {"ok": not res.isError, "text": text}
+            except Exception as e:  # noqa: BLE001
+                return k, {"ok": False, "text": f"{type(e).__name__}: {e}"}
+
+        pairs = await asyncio.gather(*(one(k) for k in keys))
+        return {"tool": tool_name, "sources": len(pairs), "results": dict(pairs)}
+
+    async def read_resource(self, agg_uri: str):
+        if agg_uri not in self.resources:
+            raise KeyError(agg_uri)
+        server, orig, _ = self.resources[agg_uri]
+        return await self.upstreams[server].session.read_resource(orig)
+
+    async def get_prompt(self, key: str, arguments: dict | None = None):
+        if key not in self.prompts:
+            raise KeyError(key)
+        server, name, _ = self.prompts[key]
+        return await self.upstreams[server].session.get_prompt(name, arguments or {})
