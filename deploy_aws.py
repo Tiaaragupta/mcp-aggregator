@@ -39,25 +39,96 @@ def outputs():
     return {o["OutputKey"]: o["OutputValue"] for o in st.get("Outputs", [])}
 
 
+def _retry(fn, tries=6):
+    """Home Wi-Fi/DNS blips happen; retry network calls a few times."""
+    for i in range(tries):
+        try:
+            return fn()
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            if i == tries - 1:
+                raise
+            time.sleep(5)
+
+
 def get(url, path):
-    t = time.perf_counter()
-    with urllib.request.urlopen(url.rstrip("/") + path, timeout=30) as r:
-        body = r.read().decode()
-    return json.loads(body), (time.perf_counter() - t) * 1000
+    def once():
+        t = time.perf_counter()
+        with urllib.request.urlopen(url.rstrip("/") + path, timeout=30) as r:
+            body = r.read().decode()
+        return json.loads(body), (time.perf_counter() - t) * 1000
+    return _retry(once)
 
 
 def post(url, path, payload):
-    req = urllib.request.Request(url.rstrip("/") + path, json.dumps(payload).encode(), {"Content-Type": "application/json"})
-    t = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=60) as r:
-        body = r.read().decode()
-    return json.loads(body), (time.perf_counter() - t) * 1000
+    def once():
+        req = urllib.request.Request(url.rstrip("/") + path, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+        t = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = r.read().decode()
+        return json.loads(body), (time.perf_counter() - t) * 1000
+    return _retry(once)
+
+
+def mcp_check(url):
+    """Talk to the deployed gateway as a real MCP client over streamable HTTP."""
+    import asyncio
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async def go():
+        async with streamablehttp_client(url.rstrip("/") + "/mcp") as (r, w, _):
+            async with ClientSession(r, w) as sess:
+                init = await sess.initialize()
+                tools = (await sess.list_tools()).tools
+                out = await sess.call_tool("demo__add", {"a": 20, "b": 22})
+                return {"server": init.serverInfo.name, "tools": len(tools), "demo__add(20,22)": out.content[0].text}
+    for i in range(4):                 # network blips: retry a few times
+        try:
+            return asyncio.run(go())
+        except Exception:
+            if i == 3:
+                raise
+            time.sleep(5)
+
+
+def verify(url):
+    res = {"url": url, "region": REGION, "account": ACCT}
+    tools, _ = get(url, "/tools")
+    res["tools_discovered"] = len(tools) if isinstance(tools, list) else len(tools.get("tools", tools))
+    lat = []
+    for i in range(20):
+        r, ms = post(url, "/call", {"tool": "demo__add", "arguments": {"a": i, "b": 1}})
+        lat.append(ms)
+    lat.sort()
+    res["latency_ms_via_api_gateway"] = {"n": 20, "p50": round(lat[10], 1), "p95": round(lat[18], 1)}
+    res["call_sample"] = r
+    res["health"], _ = post(url, "/health/check", {})
+    res["rediscover"], _ = post(url, "/rediscover", {})
+    try:
+        res["route"], _ = post(url, "/route", {"query": "remember my idea"})
+    except urllib.error.HTTPError as e:
+        res["route"] = f"HTTP {e.code}"
+    res["mcp_over_http"] = mcp_check(url)
+    feed, _ = get(url, "/trace/recent?since=0")
+    res["trace_feed_events"] = len(feed["events"])
+    lam = boto3.client("lambda", region_name=REGION)
+    fname = next(r["PhysicalResourceId"] for r in cf.describe_stack_resources(StackName=STACK)["StackResources"] if r["LogicalResourceId"] == "RediscoveryFunction")
+    inv = lam.invoke(FunctionName=fname)
+    res["eventbridge_lambda_invoke"] = {"status": inv["StatusCode"], "payload": inv["Payload"].read().decode()[:300]}
+    say(json.dumps(res, indent=2))
+    (ROOT / "results").mkdir(exist_ok=True)
+    (ROOT / "results" / "aws_deploy.json").write_text(json.dumps(res, indent=2))
+    (ROOT / "results" / "aws_deploy.md").write_text("# Real AWS deployment evidence\n\n```\n" + "\n".join(lines) + "\n```\n")
+    say("Saved results/aws_deploy.md. Take screenshots of the console (ECS, DynamoDB, CloudWatch, X-Ray, EventBridge) too. "
+        "Run `python deploy_aws.py --destroy` when done.")
 
 
 def main():
     if "--destroy" in sys.argv:
         return destroy()
     say(f"AWS account {ACCT}, region {REGION}")
+    if "--verify" in sys.argv:          # tests only, against the stack that is already running
+        return verify(outputs()["ApiUrl"])
     vpc = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"][0]["VpcId"]
     subs = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc]}])["Subnets"]
     by_az = {}
@@ -99,42 +170,27 @@ def main():
     url = out["ApiUrl"]
     say(f"Live URL: {url}")
 
-    say("Waiting for the service to become healthy...")
+    # The image tag is always :latest, so CloudFormation sees no change; force ECS to pull the new image.
+    ecs = boto3.client("ecs", region_name=REGION)
+    rs = {r["LogicalResourceId"]: r["PhysicalResourceId"] for r in cf.describe_stack_resources(StackName=STACK)["StackResources"]}
+    cluster = rs["Cluster"]
+    svc_name = rs["Service"].split("/")[-1]
+    ecs.update_service(cluster=cluster, service=svc_name, forceNewDeployment=True)
+    say("Rolling the ECS service onto the new image (about 3-5 minutes)...")
+    ecs.get_waiter("services_stable").wait(cluster=cluster, services=[svc_name], WaiterConfig={"Delay": 15, "MaxAttempts": 60})
+
+    say("Waiting for the new version to answer...")
     for _ in range(40):
         try:
-            h, _ = get(url, "/healthz")
+            get(url, "/healthz")
+            get(url, "/trace/recent")      # only exists in the newest image
             break
         except Exception:
             time.sleep(15)
     else:
         raise SystemExit("service did not become healthy; check ECS logs in CloudWatch")
 
-    res = {"url": url, "region": REGION, "account": ACCT}
-    tools, _ = get(url, "/tools")
-    res["tools_discovered"] = len(tools) if isinstance(tools, list) else len(tools.get("tools", tools))
-    lat = []
-    for i in range(20):
-        r, ms = post(url, "/call", {"tool": "demo__add", "arguments": {"a": i, "b": 1}})
-        lat.append(ms)
-    lat.sort()
-    res["latency_ms_via_api_gateway"] = {"n": 20, "p50": round(lat[10], 1), "p95": round(lat[18], 1)}
-    res["call_sample"] = r
-    res["health"], _ = post(url, "/health/check", {})
-    res["rediscover"], _ = post(url, "/rediscover", {})
-    try:
-        res["route"], _ = post(url, "/route", {"query": "remember my idea"})
-    except urllib.error.HTTPError as e:
-        res["route"] = f"HTTP {e.code}"
-    lam = boto3.client("lambda", region_name=REGION)
-    fname = next(r["PhysicalResourceId"] for r in cf.describe_stack_resources(StackName=STACK)["StackResources"] if r["LogicalResourceId"] == "RediscoveryFunction")
-    inv = lam.invoke(FunctionName=fname)
-    res["eventbridge_lambda_invoke"] = {"status": inv["StatusCode"], "payload": inv["Payload"].read().decode()[:300]}
-    say(json.dumps(res, indent=2))
-    (ROOT / "results").mkdir(exist_ok=True)
-    (ROOT / "results" / "aws_deploy.json").write_text(json.dumps(res, indent=2))
-    (ROOT / "results" / "aws_deploy.md").write_text("# Real AWS deployment evidence\n\n```\n" + "\n".join(lines) + "\n```\n")
-    say("Saved results/aws_deploy.md. Take screenshots of the console (ECS, DynamoDB, CloudWatch, X-Ray, EventBridge) too. "
-        "Run `python deploy_aws.py --destroy` when done.")
+    verify(url)
 
 
 if __name__ == "__main__":

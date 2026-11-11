@@ -6,9 +6,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from starlette.routing import Route
 from pydantic import BaseModel
 
 from . import tracing
+from .gateway import build_server
 from .router import Router
 from .store import SCHEMA_VERSION, store_from_env
 from .upstream import UpstreamManager
@@ -51,6 +54,10 @@ def create_app(manager: UpstreamManager | None = None, bedrock_client=None, heal
         bedrock_client = boto3.client("bedrock-runtime")
     router = Router(mgr, bedrock_client=bedrock_client, **({"model_id": model_id} if model_id else {}))
 
+    # The same MCP server as gateway.py (stdio), served over streamable HTTP at /mcp.
+    # stateless + JSON responses so it works behind API Gateway / ALB with several tasks.
+    mcp_manager = StreamableHTTPSessionManager(app=build_server(mgr), json_response=True, stateless=True)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         tracing.configure_from_env()
@@ -58,12 +65,26 @@ def create_app(manager: UpstreamManager | None = None, bedrock_client=None, heal
             await mgr.start()
         if health_interval:
             mgr.start_health_loop(health_interval)
-        yield
+        async with mcp_manager.run():
+            yield
         await mgr.close()
 
     app = FastAPI(title="MCP Aggregator", lifespan=lifespan)
     app.state.manager = mgr
     app.state.router = router
+
+    class MCPEndpoint:
+        async def __call__(self, scope, receive, send):
+            await mcp_manager.handle_request(scope, receive, send)
+
+    app.router.routes.append(Route("/mcp", endpoint=MCPEndpoint()))
+    app.router.routes.append(Route("/mcp/", endpoint=MCPEndpoint()))
+
+    @app.get("/trace/recent")
+    async def trace_recent(since: int = 0):
+        """Polling fallback for the live feed (HTTP API Gateway cannot carry WebSockets)."""
+        events = [dict(e, seq=n) for n, e in list(tracing.RECENT) if n > since]
+        return {"events": events, "last": events[-1]["seq"] if events else since}
 
     @app.get("/")
     async def index():

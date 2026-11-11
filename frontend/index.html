@@ -71,7 +71,7 @@
   </section>
 
   <section class="wide">
-    <h2>Live trace feed (WebSocket)</h2>
+    <h2>Live trace feed (WebSocket, polling fallback)</h2>
     <div id="feed"></div>
   </section>
 </main>
@@ -126,10 +126,24 @@ function feed(ev){
   $('feed').prepend(d);
   while ($('feed').children.length > 80) $('feed').lastChild.remove();
 }
+let wsOk = false, lastSeq = 0, polling = false;
+async function poll(){
+  try{
+    const r = await (await fetch('/trace/recent?since='+lastSeq)).json();
+    r.events.forEach(ev => { if (ev.hop) feed(ev); });
+    lastSeq = r.last;
+    $('wsdot').className='dot ok'; $('wstxt').textContent='live (polling)';
+  }catch(e){ $('wsdot').className='dot'; $('wstxt').textContent='offline'; }
+}
+function startPolling(){ if (polling) return; polling = true; poll(); setInterval(poll, 2000); }
 function connectWS(){
-  const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-  ws.onopen = () => { $('wsdot').className='dot ok'; $('wstxt').textContent='live'; };
-  ws.onclose = () => { $('wsdot').className='dot'; $('wstxt').textContent='reconnecting…'; setTimeout(connectWS, 2000); };
+  let ws;
+  try{ ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'); }catch(e){ startPolling(); return; }
+  ws.onopen = () => { wsOk = true; $('wsdot').className='dot ok'; $('wstxt').textContent='live'; };
+  ws.onclose = () => {
+    if (!wsOk) { startPolling(); return; }   // never connected: WebSocket not available here (e.g. HTTP API Gateway)
+    wsOk = false; $('wsdot').className='dot'; $('wstxt').textContent='reconnecting…'; setTimeout(connectWS, 2000);
+  };
   ws.onmessage = m => { const ev = JSON.parse(m.data); if (ev.hop) feed(ev); };
 }
 load(); connectWS(); setInterval(load, 15000);

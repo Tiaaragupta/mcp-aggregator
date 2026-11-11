@@ -1,5 +1,7 @@
 """Structured JSON logs, trace IDs, per-hop latency, optional CloudWatch sink, live event feed."""
 import asyncio
+import collections
+import itertools
 import json
 import os
 import sys
@@ -11,6 +13,8 @@ LOG_FILE = Path(__file__).resolve().parent.parent / "logs" / "gateway.jsonl"
 
 SINKS: list = []                       # extra sinks, e.g. CloudWatchSink
 SUBSCRIBERS: set[asyncio.Queue] = set()  # live WebSocket listeners
+RECENT: collections.deque = collections.deque(maxlen=500)  # (seq, event) for polling clients
+_SEQ = itertools.count(1)
 
 
 def new_trace_id() -> str:
@@ -93,6 +97,7 @@ def log_event(event: dict):
         pass
     # stderr, never stdout, because stdout carries MCP messages in gateway mode
     print(line, file=sys.stderr)
+    RECENT.append((next(_SEQ), event))
     for sink in SINKS:
         try:
             sink.emit(event)

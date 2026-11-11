@@ -70,9 +70,9 @@ python -m aggregator.gateway                       # run as a stdio MCP server f
 
 **Not working on real AWS: Bedrock.** The routing code calls Bedrock `converse`, and it is covered by tests with a fake client. On the real account every Bedrock model call (Claude Haiku 4.5, Amazon Nova) returned `ValidationException: Operation not allowed`, an account-level restriction on this newly activated account (an AWS Support case is open). Routing therefore ran in **keyword fallback mode** on AWS (`"method": "keyword"` in the evidence file). The default model id is `anthropic.claude-haiku-4-5-20251001-v1:0` (the older Claude 3 Haiku has reached end of life on Bedrock). The model's real routing accuracy has **not** been measured.
 
-**Not deployed:** a WebSocket API Gateway. The live endpoint is an HTTP API. The dashboard's `/ws` live feed works locally and inside the container, but was not checked through API Gateway.
+**MCP over HTTP and the live feed on AWS.** The gateway is also served as a real MCP server over streamable HTTP at `/mcp` (same server object as the stdio `gateway.py`; stateless JSON mode so it works behind API Gateway). `tests/test_mcp_http.py` connects a real MCP client to it. API Gateway HTTP APIs cannot carry WebSockets, so the dashboard falls back to polling `/trace/recent` when `/ws` cannot connect; the feed then shows "live (polling)". `deploy_aws.py` checks both against the live URL (`mcp_over_http`, `trace_feed_events` in `results/aws_deploy.json`).
 
-* The deployed endpoint serves the REST API and dashboard. The MCP-protocol interface (`aggregator/gateway.py`) is stdio; the contract tests validate it with a real MCP client.
+* The MCP-protocol interface is available over stdio (`aggregator/gateway.py`) and HTTP (`/mcp`); contract tests cover both.
 * Routing: the keyword router scores 10/10 on the 4-tool demo catalog, but only **57.5% top-1 / 77.5% top-3** on a harder blind benchmark (40 queries, 12 tools, many paraphrases; `tests/routing_benchmark.py`, written before running and never tuned). Keyword matching fails on paraphrases ("will it rain" -> weather), which is why the Bedrock router exists.
 * To redeploy: see `deploy/DEPLOY.md`. ALB + Fargate cost a few dollars per day if left running; tear down with `python deploy_aws.py --destroy`.
 

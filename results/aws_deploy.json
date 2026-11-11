@@ -5,8 +5,8 @@
   "tools_discovered": 5,
   "latency_ms_via_api_gateway": {
     "n": 20,
-    "p50": 889.4,
-    "p95": 1022.5
+    "p50": 920.1,
+    "p95": 957.3
   },
   "call_sample": {
     "isError": false,
@@ -35,6 +35,12 @@
       }
     ]
   },
+  "mcp_over_http": {
+    "server": "mcp-aggregator",
+    "tools": 5,
+    "demo__add(20,22)": "42"
+  },
+  "trace_feed_events": 82,
   "eventbridge_lambda_invoke": {
     "status": 200,
     "payload": "{\"health\": {\"demo\": true, \"notes\": true}, \"tools_after_rediscovery\": 5}"

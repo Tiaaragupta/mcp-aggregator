@@ -54,3 +54,12 @@ def test_servers_status_hides_secrets(client):
 def test_healthz_and_manual_health_check(client):
     assert client.get("/healthz").json()["ok"] is True
     assert client.post("/health/check").json() == {"demo": True, "notes": True}
+
+
+def test_trace_recent_polling_fallback(client):
+    client.post("/call", json={"tool": "demo__add", "arguments": {"a": 1, "b": 2}})
+    r = client.get("/trace/recent?since=0").json()
+    assert r["events"] and r["last"] >= r["events"][-1]["seq"]
+    assert any(e.get("tool") == "demo__add" for e in r["events"])
+    again = client.get(f"/trace/recent?since={r['last']}").json()
+    assert again["events"] == [] and again["last"] == r["last"]
