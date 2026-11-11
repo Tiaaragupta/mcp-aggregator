@@ -1,4 +1,4 @@
-{
+﻿{
   "region": "us-east-1",
   "checks": {
     "DynamoDB registry": {
@@ -18,7 +18,7 @@
       "detail": "method=keyword -> notes__save_note (model anthropic.claude-3-haiku-20240307-v1:0)"
     }
   },
-  "account": "835665967684",
+  "account": "XXXXXXXXXXXX",
   "call_latency_ms_with_cloudwatch": {
     "n": 20,
     "p50": 613.3,
