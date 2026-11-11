@@ -12,7 +12,7 @@ Parameters:
     Description: At least two public subnets (different AZs).
   BedrockModelId:
     Type: String
-    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Default: anthropic.claude-haiku-4-5-20251001-v1:0
   RediscoveryRate:
     Type: String
     Default: rate(15 minutes)

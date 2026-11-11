@@ -4,6 +4,6 @@ uvicorn
 websockets
 boto3
 pytest
-moto[dynamodb,secretsmanager,logs]
+moto[dynamodb,secretsmanager,logs,server]
 httpx
 cfn-lint

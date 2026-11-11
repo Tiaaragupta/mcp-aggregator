@@ -174,10 +174,20 @@ class UpstreamManager:
                 up.healthy = False
                 up.last_error = f"{type(e).__name__}: {e}" or "unreachable"
                 await self._restart(up)
+                if not up.healthy:
+                    self._drop_capabilities(name)   # unrecoverable: stop advertising its tools
             up.last_latency_ms = round((time.perf_counter() - start) * 1000, 2)
             up.last_check = time.time()
             results[name] = up.healthy
         return results
+
+    def _drop_capabilities(self, name: str):
+        """Remove a dead server's tools/resources/prompts from the live registry and persist that."""
+        for table in (self.registry, self.resources, self.prompts):
+            for key in [k for k, v in table.items() if v[0] == name]:
+                del table[key]
+        if self.store and name in self.upstreams:
+            self.store.put(make_record(name, self.upstreams[name].config, []))
 
     async def _restart(self, up: Upstream):
         """Replace a dead upstream's task with a fresh one."""

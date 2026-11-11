@@ -1,0 +1,42 @@
+{
+  "url": "https://2ba2r5y7oa.execute-api.us-east-1.amazonaws.com",
+  "region": "us-east-1",
+  "account": "835665967684",
+  "tools_discovered": 5,
+  "latency_ms_via_api_gateway": {
+    "n": 20,
+    "p50": 889.4,
+    "p95": 1022.5
+  },
+  "call_sample": {
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "20",
+        "annotations": null,
+        "meta": null
+      }
+    ]
+  },
+  "health": {
+    "demo": true,
+    "notes": true
+  },
+  "rediscover": {
+    "tools": 5
+  },
+  "route": {
+    "method": "keyword",
+    "matches": [
+      {
+        "tool": "notes__save_note",
+        "score": 5.219
+      }
+    ]
+  },
+  "eventbridge_lambda_invoke": {
+    "status": 200,
+    "payload": "{\"health\": {\"demo\": true, \"notes\": true}, \"tools_after_rediscovery\": 5}"
+  }
+}

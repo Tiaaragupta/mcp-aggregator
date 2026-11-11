@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("NOTES_TOKEN", "eval-token")
-from aggregator.router import Router  # noqa: E402
+from aggregator.router import Router, keyword_rank  # noqa: E402
+from tests.routing_benchmark import CASES, CATALOG  # noqa: E402
 from aggregator.upstream import UpstreamManager  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
@@ -77,6 +78,15 @@ async def main():
         hits += bool(got) and got[0]["tool"].split("__", 1)[1] == want.split("__", 1)[1]
     out["routing"] = {"cases": len(ROUTING_SET), "correct": hits, "accuracy_pct": round(100 * hits / len(ROUTING_SET), 1)}
 
+    # blind benchmark: 12-tool catalog, 40 queries incl. paraphrases (written before running, never tuned)
+    top1 = top3 = 0
+    for q, want in CASES:
+        ranked = [x["tool"] for x in keyword_rank(q, CATALOG, 3)]
+        top1 += bool(ranked) and ranked[0] == want
+        top3 += want in ranked
+    out["routing_benchmark"] = {"cases": len(CASES), "top1_pct": round(100 * top1 / len(CASES), 1),
+                                "top3_pct": round(100 * top3 / len(CASES), 1)}
+
     # fan-out aggregation across overlapping servers
     s = time.perf_counter()
     fan = await m.call_all("echo", {"text": "hi"})
@@ -115,6 +125,7 @@ async def main():
 | Initial discovery time | {out['discovery_ms']} ms |
 | Tool call latency (n={c['n']}) | mean {c['mean']} ms, p50 {c['p50']} ms, p95 {c['p95']} ms, max {c['max']} ms |
 | Routing accuracy | {out['routing']['correct']}/{out['routing']['cases']} ({out['routing']['accuracy_pct']}%) |
+| Routing benchmark (keyword, 40 blind queries, 12 tools) | top-1 {out['routing_benchmark']['top1_pct']}%, top-3 {out['routing_benchmark']['top3_pct']}% |
 | Fan-out across overlapping servers | {out['fanout']['sources']} sources in {out['fanout']['ms']} ms |
 | Health check (all servers) | {out['health_check_ms']} ms, all healthy: {out['all_healthy']} |
 | Failure recovery (killed server restarted) | recovered: {out['recovery']['recovered']} in {out['recovery']['ms']} ms |

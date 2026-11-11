@@ -1,0 +1,27 @@
+{
+  "region": "us-east-1",
+  "checks": {
+    "DynamoDB registry": {
+      "ok": true,
+      "detail": "2 servers stored, schema v2: ['demo:2 tools', 'notes:3 tools']"
+    },
+    "Secrets Manager injection": {
+      "ok": true,
+      "detail": "downstream server reported: token present (length 16) (secret value never printed)"
+    },
+    "CloudWatch Logs": {
+      "ok": true,
+      "detail": "40 events in /mcp-aggregator/live-check-6348a3, 20 X-Ray-format trace IDs; p50 613.3 ms, p95 618.5 ms"
+    },
+    "Bedrock routing": {
+      "ok": false,
+      "detail": "method=keyword -> notes__save_note (model anthropic.claude-3-haiku-20240307-v1:0)"
+    }
+  },
+  "account": "835665967684",
+  "call_latency_ms_with_cloudwatch": {
+    "n": 20,
+    "p50": 613.3,
+    "p95": 618.5
+  }
+}

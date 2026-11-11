@@ -1,0 +1,37 @@
+{
+  "startup_s": 0.68,
+  "dynamodb_registry": {
+    "demo": {
+      "tools": 2,
+      "schema_version": 2
+    },
+    "notes": {
+      "tools": 3,
+      "schema_version": 2
+    }
+  },
+  "secrets_manager": "token present (length 20)",
+  "calls_with_cloudwatch_ms": {
+    "n": 50,
+    "p50": 12.94,
+    "p95": 15.97
+  },
+  "cloudwatch": {
+    "events": 100,
+    "distinct_trace_ids": 50,
+    "xray_format": true
+  },
+  "bedrock_router": {
+    "method": "bedrock",
+    "matches": [
+      {
+        "tool": "notes__save_note",
+        "score": 3
+      }
+    ]
+  },
+  "eventbridge_style_health_recovery": {
+    "recovered": true,
+    "ms": 507
+  }
+}
